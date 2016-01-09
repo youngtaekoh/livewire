@@ -59,10 +59,12 @@ private:
 	std::priority_queue<PriorityQueueElement, 
 						std::vector<PriorityQueueElement>,
 						std::greater<PriorityQueueElement> > queue_;
+    int nElements;
 	
 public:
 	PriorityQueue(int nElem) : existence_(nElem, false)
 	{
+        nElements = 0;
 	}
 	
 	void add(double score, int elem) {
@@ -70,15 +72,21 @@ public:
 		e.score = score;
 		e.elem = elem;
 		queue_.push(e);
-		existence_[elem] = true;
+        if (!existence_[elem]) {            
+            existence_[elem] = true;
+            ++nElements;
+        }
 	}
 	
 	bool empty() const {
-		return queue_.empty();
+        return nElements == 0;
 	}
 	
 	void remove(int elem) {
-		existence_[elem] = false;
+        if (existence_[elem]) {
+            existence_[elem] = false;
+            --nElements;
+        }
 	}
 	
 	bool exist(int elem) {
@@ -87,13 +95,13 @@ public:
 	
 	int pop() {
 		int val;
-		bool removed;
 		while (true) {
 			const PriorityQueueElement& e = queue_.top();
 			val = e.elem;
 			queue_.pop();
 			if (existence_[val]) {
 				existence_[val] = false;
+                --nElements;
 				return val;
 			}
 		}
@@ -147,7 +155,7 @@ double lowcost(int p, int q, int nRow, int nCol, double g, double gmin, double g
 	std::div_t ret_q = std::div(q, nCol);
     int dx = ret_p.rem - ret_q.rem;
     int dy = ret_p.quot - ret_q.quot;
-    double norm = std::sqrt(dx * dx + dy * dy);
+    double norm = std::sqrt(static_cast<double>(dx * dx + dy * dy));
     return (1 - ((g - gmin) / (gmax - gmin)))*norm/1.4142135623730951;
 }
 
