@@ -10,6 +10,7 @@ import numpy as np
 from scipy import interpolate
 import cv2
 import os
+import SimpleITK as sitk
 
 import mylivewire
 from PyQt4.QtGui import *
@@ -119,6 +120,10 @@ class MyImage(QLabel):
     messagePrinted = pyqtSignal(str)
     pointSize = 6
     
+    # define modes
+    SegmentMode, LiveWireMode = range(2)
+    mode = SegmentMode
+    
     def __init__(self, controlPanel, parent=None):
         super(MyImage, self).__init__(parent)
         self.qImage = None
@@ -130,13 +135,22 @@ class MyImage(QLabel):
         self.lastPt = (0, 0)
         self.controlPanel = controlPanel
         
+    def resetComputed(self):
+        self.points = []
+        self.curves = []
+        self.interpCurve = None
+        self.inflections = None
+        self.curCrv = None
+        self.lastPt = (0, 0)        
+        
     def setCVimage(self, cvImage):
+        self.resetComputed()
         self.cvImage = cvImage
         self.qImage = ConvertCVImg2QImage(self.cvImage)        
-        self.setFixedSize(self.qImage.size())
+        self.setFixedSize(self.qImage.size())     
         
-        self.G = PrepareLiveWire(self.cvImage)        
-        self.p = np.zeros(self.G.shape, dtype=np.int32)
+        # set mode to segmentation mode
+        self.mode = self.SegmentMode
         
     def computeInflections(self, res):
         if len(self.points) > 1:
@@ -232,9 +246,8 @@ class MyImage(QLabel):
             self.drawInflectionPoints(painter)
             
             painter.end()
-        
-    def mousePressEvent(self, event):
-        super(MyImage, self).mousePressEvent(event)
+            
+    def livewireModeMousePressEvent(self, event):
         if Qt.LeftButton == event.button():
             if Qt.ShiftModifier == event.modifiers():
                 if len(self.points) > 0:
@@ -262,6 +275,34 @@ class MyImage(QLabel):
             except IndexError:
                 pass
             self.repaint()
+            
+    def segmentModeMousePressEvent(self, event):
+        if Qt.LeftButton == event.button():
+            s = (event.y(), event.x())        
+            # 여기서 segmentation 수행            
+            img = cv2.cvtColor(self.cvImage, cv2.COLOR_RGB2GRAY)
+            sitkImage = sitk.GetImageFromArray(img)            
+            sitkImage = sitk.CurvatureFlow(sitkImage, 0.125, 5)
+            sitkImage = sitk.ConfidenceConnected(sitkImage, [s], 5, 2.5, 1, 255)
+            img = sitk.GetArrayFromImage(sitkImage)
+            qImg = self.cvImage * img[..., np.newaxis]            
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)            
+            self.qImage = ConvertCVImg2QImage(qImg)
+            
+            # do this after segmentation
+            self.G = PrepareLiveWire(img)
+            self.p = np.zeros(self.G.shape, dtype=np.int32)
+            self.repaint()
+            
+            self.mode = self.LiveWireMode;
+        
+    def mousePressEvent(self, event):
+        super(MyImage, self).mousePressEvent(event)
+        if self.LiveWireMode == self.mode:
+            self.livewireModeMousePressEvent(event)
+        elif self.SegmentMode == self.mode:
+            self.segmentModeMousePressEvent(event)
+        
 
 class MyDialog(QDialog):
     def __setResolutionSpinBox(self, var):
@@ -346,7 +387,7 @@ class MyDialog(QDialog):
             self.imageLabel.setCVimage(cvImage)
             self.adjustSize()
             self.infoLabel.setText("{} is now loaded...".format(filename))
-            self.imageFilename = filename
+            self.imageFilename = filename            
             
     def loadCurve(self):
         if (self.imageFilename is not None):
