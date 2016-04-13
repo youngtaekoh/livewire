@@ -21,6 +21,10 @@ class DebugData():
     res = None
     fit_x = None
     fit_y = None
+    dbgImage = None
+    
+class Settings():
+    pointSize = 6
 
 def ImageToPhysics(pixel, res):
     ''' convert pixel value in image coordinate to physical coordinate '''
@@ -34,6 +38,9 @@ def PhysicsToImage(phy, res):
     return (px, py)    
 
 def ConvertCVImg2QImage(cvImage):
+    if cvImage is None:
+        return None
+        
     height, width, byteValue = cvImage.shape
     byteValue = byteValue * width
     cv2.cvtColor(cvImage, cv2.COLOR_BGR2RGB, cvImage)
@@ -75,242 +82,496 @@ def drawCurve(painter, curve):
             painter.drawPolyline(polyline)                    
     except TypeError:
         pass
+        
+def segmentImage(image, seeds, iter, mult):
+    img = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    sitkImage = sitk.GetImageFromArray(img)            
+    sitkImage = sitk.CurvatureFlow(sitkImage, 0.125, 5)
+    sitkImage = sitk.ConfidenceConnected(sitkImage, seeds, iter, mult, 1, 255)
+    img = sitk.GetArrayFromImage(sitkImage)
+    #qImg = self.cvImage * img[..., np.newaxis]            
+    return cv2.cvtColor(img, cv2.COLOR_GRAY2RGB) 
+                
+class MeasureWidget(QWidget):
+    messagePrinted = pyqtSignal(str)
     
-class ControlPanel(QWidget):
-    # defines 'ComputeInflections' is pressed.
-    requestComputeInflections = pyqtSignal()
-    requestRepaint = pyqtSignal()
+    class ControlPanel(QWidget):
+        # defines 'ComputeInflections' is pressed.
+        requestComputeInflections = pyqtSignal()
+        requestRepaint = pyqtSignal()
+        
+        def __init__(self, parent=None):
+            super(MeasureWidget.ControlPanel, self).__init__(parent)        
+            
+            optLayout = QVBoxLayout()
+            self.cbDrawInputCurve = QCheckBox("Input curves")
+            self.cbDrawInputCurve.setChecked(True)
+            self.cbDrawInputCurve.stateChanged.connect(self.emitRepaintRequest)
+            optLayout.addWidget(self.cbDrawInputCurve)
+            
+            self.cbDrawPoints = QCheckBox("Click points")
+            self.cbDrawPoints.setChecked(True)
+            self.cbDrawPoints.stateChanged.connect(self.emitRepaintRequest)
+            optLayout.addWidget(self.cbDrawPoints)
+            
+            # turn on/off inflection points
+            self.cbDrawInflections = QCheckBox("Inflection points")
+            self.cbDrawInflections.setChecked(True)
+            self.cbDrawInflections.stateChanged.connect(self.emitRepaintRequest)
+            optLayout.addWidget(self.cbDrawInflections)      
+            
+            # create iteration
+            optLayout.addWidget(QLabel("Smoothing condition"))
+            self.smoothing = QDoubleSpinBox(self)
+            self.smoothing.setRange(0, 1000)
+            self.smoothing.setSingleStep(1)
+            self.smoothing.setValue(100.0)        
+            self.smoothing.valueChanged.connect(self.requestComputeInflections)
+            optLayout.addWidget(self.smoothing)
+            
+            def __setResolutionSpinBox(var):
+                var.setRange(0, 100)
+                var.setSingleStep(0.01)
+                var.setDecimals(2)
+                var.setValue(1)            
+            
+            self.sbXres = QDoubleSpinBox(self)
+            __setResolutionSpinBox(self.sbXres)        
+            lbXres = QLabel("horizontal res.", self)        
+            lbXres.setBuddy(self.sbXres)
+            
+            self.sbYres = QDoubleSpinBox(self)
+            __setResolutionSpinBox(self.sbYres)
+            lbYres = QLabel("vertical res.", self)
+            lbYres.setBuddy(self.sbYres)
+            
+            optLayout.addWidget(lbXres)
+            optLayout.addWidget(self.sbXres)
+            optLayout.addWidget(lbYres)
+            optLayout.addWidget(self.sbYres)               
+            
+            self.btnComputeInflections = QPushButton("Compute Inflections")
+            self.btnComputeInflections.pressed.connect(self.requestComputeInflections)
+            optLayout.addWidget(self.btnComputeInflections)
+
+            optLayout.addStretch()
+            
+            self.setLayout(optLayout)
+    
+        @pyqtSlot(int)        
+        def emitRepaintRequest(self, int):
+            self.requestRepaint.emit()
+            
+        def isDrawingInputCurves(self):
+            return self.cbDrawInputCurve.isChecked()
+            
+        def isDrawingControlPoints(self):
+            return self.cbDrawPoints.isChecked()
+            
+        def isDrawingInflections(self):
+            return self.cbDrawInflections.isChecked()
+            
+        def getXres(self):
+            return self.sbXres.value()
+            
+        def getYres(self):
+            return self.sbYres.value()
+            
+        def getInterpolationParams(self):
+            return self.smoothing.value()
+            
+        def adjustSmoothingCondition(self, m):
+            ''' adjust smoothing spin box according to m '''
+            min, max = (m-np.math.sqrt(2*m),m+np.math.sqrt(2*m))
+            self.smoothing.setRange(0, max*1.5)
+            self.smoothing.setValue((min + max)*0.5)
+    
+    class MyImage(QLabel):
+        ''' Image control '''
+        messagePrinted = pyqtSignal(str)
+        pointsChanged = pyqtSignal()
+        
+        def __init__(self, controlPanel, parent=None):
+            super(MeasureWidget.MyImage, self).__init__(parent)
+            self.qImage = None            
+            self.controlPanel = controlPanel
+            self.resetComputed()
+            
+        def resetComputed(self):
+            self.points = []
+            self.curves = []
+            self.interpCurve = None
+            self.inflections = None
+            self.curCrv = None
+            self.lastPt = (0, 0)    
+            self.numberOfPoints = 0    
+            
+        def setCVimage(self, cvImage):
+            self.cvImage = cvImage
+            self.qImage = ConvertCVImg2QImage(self.cvImage)        
+            self.setFixedSize(self.qImage.size())     
+            
+            self.G = PrepareLiveWire(cvImage)
+            self.p = np.zeros(self.G.shape, dtype=np.int32)
+            
+        def computeInflections(self, res):
+            if len(self.points) > 1:
+                fit_x = np.array([])
+                fit_y = np.array([])
+                for crv in self.curves:
+                    fit_x = np.hstack((fit_x, crv[:, 0]))
+                    fit_y = np.hstack((fit_y, crv[:, 1]))
+                    
+                # convert fit_x, fit_y into the physical coordinate.
+                for i, (x, y) in enumerate(zip(fit_x, fit_y)):
+                    phy = ImageToPhysics((x,y), res)
+                    fit_x[i] = phy[0]
+                    fit_y[i] = phy[1]
+                
+                try:                
+                    user_s = self.controlPanel.getInterpolationParams()
+                    tck, u = interpolate.splprep([fit_x, fit_y], k=4, s=user_s)
+                    out = interpolate.splev(u, tck)
+                    
+                    # convert interpolated curve points to Image Coordinate.
+                    for i, (x, y) in enumerate(zip(out[0], out[1])):
+                        img = PhysicsToImage((x, y), res)
+                        out[0][i] = img[0]
+                        out[1][i] = img[1]
+                        
+                    self.interpCurve = np.column_stack((out[0], out[1])).astype(np.int32)
+                    
+                    # compute length
+                    dxdy = res * np.diff(self.interpCurve, axis=0)
+                    length = np.sum( np.linalg.norm(dxdy, 2, axis=1) )
+                    
+                    unew = np.linspace(0, 1, len(u), endpoint=True)
+                    dx = interpolate.splev(unew, tck, der=1)
+                    ddx = interpolate.splev(unew, tck, der=2)
+                    k_sample = (dx[0]*ddx[1]-ddx[0]*dx[1])/np.linalg.norm(dx)**3
+                    fs = interpolate.InterpolatedUnivariateSpline(unew, k_sample, k=3)
+                    roots = fs.roots()      
+        
+                    if (len(roots)>0):
+                        outroots = []
+                        out = interpolate.splev(roots, tck)
+                        for ipt in np.transpose(out):
+                            ipt = PhysicsToImage(ipt, res)
+                            outroots.append(ipt)
+                        roots = outroots            
+                    self.inflections = roots
+                    self.messagePrinted.emit("Inflection points: {} length: {:.2f} mm".format(len(roots), length))
+                except ValueError as e:
+                    print e
+                    pass
+            self.repaint()        
+            
+        def drawCurves(self, painter):
+            painter.setPen(Qt.red)
+            for crv in self.curves:                
+                drawCurve(painter, crv)
+                
+            drawCurve(painter, self.curCrv)            
+            if self.controlPanel.isDrawingControlPoints():
+                pen = QPen(painter.pen())
+                pen.setColor(QColor(Qt.red))
+                painter.setPen(pen)
+                painter.setBrush(Qt.red)
+                
+                for p in self.points:
+                    painter.drawEllipse(p[0], p[1], Settings.pointSize, Settings.pointSize)
+                
+        def drawInflectionPoints(self, painter):                    
+            try:
+                painter.setPen(Qt.green)
+                drawCurve(painter, self.interpCurve)
+                
+                if self.controlPanel.isDrawingInflections():
+                    pen = QPen(painter.pen())
+                    pen.setColor(QColor(Qt.green))
+                    painter.setPen(pen)
+                    painter.setBrush(Qt.green)
+                
+                    for p in self.inflections:
+                        painter.drawEllipse(p[0], p[1], Settings.pointSize, Settings.pointSize)
+            except TypeError:
+                pass
+            
+        def paintEvent(self, paintEvent):
+            if self.qImage is not None:
+                painter = QPainter()
+                painter.begin(self)
+                painter.drawImage(0, 0, self.qImage)
+                
+                if self.controlPanel.isDrawingInputCurves():
+                    self.drawCurves(painter)
+                    
+                self.drawInflectionPoints(painter)
+                
+                painter.end()
+                
+        def mousePressEvent(self, event):
+            super(MeasureWidget.MyImage, self).mousePressEvent(event)
+            if Qt.LeftButton == event.button():
+                if Qt.ShiftModifier == event.modifiers():
+                    if len(self.points) > 0:
+                        cnt = LiveContour(self.lastPt, self.p)
+                        s = tuple(cnt[-1])
+                        self.curves.append(cnt)
+                        self.numberOfPoints = self.numberOfPoints + len(cnt)
+                        self.pointsChanged.emit()
+                    else:
+                        s = (event.x(), event.y())
+                
+                    self.points.append(s)
+                    mylivewire.mylivewire(self.p, s, self.G)
+                    self.curCrv = None                    
+                else:
+                    self.lastPt = (event.y(), event.x())
+                    self.curCrv = LiveContour(self.lastPt, self.p)
+                self.repaint()
+            elif Qt.RightButton == event.button():
+                self.interpCurve = None
+                self.inflections = None            
+                try:
+                    self.points.pop()        
+                    cnt = self.curves.pop()        
+                    self.numberOfPoints = self.numberOfPoints - len(cnt)
+                    self.pointsChanged.emit()
+                    s = self.points[-1]
+                    mylivewire.mylivewire(self.p, s, self.G)
+                except IndexError:
+                    pass
+                self.repaint()
+                
+        def getNumberOfPoints(self):
+            return self.numberOfPoints
     
     def __init__(self, parent=None):
-        super(ControlPanel, self).__init__(parent)        
+        super(MeasureWidget, self).__init__(parent)
         
-        optLayout = QHBoxLayout()
-        self.cbDrawInputCurve = QCheckBox("Input curves")
-        self.cbDrawInputCurve.setChecked(True)
-        self.cbDrawInputCurve.stateChanged.connect(self.emitRepaintRequest)
-        self.cbDrawPoints = QCheckBox("Click points")
-        self.cbDrawPoints.setChecked(True)
-        self.cbDrawPoints.stateChanged.connect(self.emitRepaintRequest)
-        self.cbDrawInflections = QCheckBox("Inflection points")
-        self.cbDrawInflections.setChecked(True)
-        self.cbDrawInflections.stateChanged.connect(self.emitRepaintRequest)
-        self.btnComputeInflections = QPushButton("Compute Inflections")
-        self.btnComputeInflections.pressed.connect(self.requestComputeInflections)
-        optLayout.addWidget(self.cbDrawInputCurve)
-        optLayout.addWidget(self.cbDrawPoints)
-        optLayout.addWidget(self.cbDrawInflections)      
-        optLayout.addWidget(self.btnComputeInflections)
-        self.setLayout(optLayout)
-
-    @pyqtSlot(int)        
-    def emitRepaintRequest(self, int):
-        self.requestRepaint.emit()
+        # Create measure widget
+        self.control = MeasureWidget.ControlPanel(self)
+        self.control.requestComputeInflections.connect(self.computeInflections)
+        self.control.requestRepaint.connect(self.repaintRequested)
+                                
+        self.imageLabel = MeasureWidget.MyImage(self.control, self) # must be changed to MyImage class
+        self.imageLabel.resize(400, 400) # initial size
+        self.imageLabel.messagePrinted.connect(self.messagePrinted)
+        self.imageLabel.pointsChanged.connect(self.pointsChanged)
         
-    def isDrawingInputCurves(self):
-        return self.cbDrawInputCurve.isChecked()
-        
-    def isDrawingControlPoints(self):
-        return self.cbDrawPoints.isChecked()
-        
-    def isDrawingInflections(self):
-        return self.cbDrawInflections.isChecked()
-            
-class MyImage(QLabel):
-    ''' Image control '''
-    messagePrinted = pyqtSignal(str)
-    pointSize = 6
-    
-    # define modes
-    SegmentMode, LiveWireMode = range(2)
-    mode = SegmentMode
-    
-    def __init__(self, controlPanel, parent=None):
-        super(MyImage, self).__init__(parent)
-        self.qImage = None
-        self.points = []
-        self.curves = []
-        self.interpCurve = None
-        self.inflections = None
-        self.curCrv = None
-        self.lastPt = (0, 0)
-        self.controlPanel = controlPanel
-        
-    def resetComputed(self):
-        self.points = []
-        self.curves = []
-        self.interpCurve = None
-        self.inflections = None
-        self.curCrv = None
-        self.lastPt = (0, 0)        
+        self.setLayout(QVBoxLayout())
+        layout = QHBoxLayout()        
+        layout.addWidget(self.imageLabel)
+        layout.addWidget(self.control)
+        self.layout().addLayout(layout)
+        self.layout().addWidget(QLabel("Right button: add a point, Left button: remove a point"))
         
     def setCVimage(self, cvImage):
-        self.resetComputed()
-        self.cvImage = cvImage
-        self.qImage = ConvertCVImg2QImage(self.cvImage)        
-        self.setFixedSize(self.qImage.size())     
+        self.imageLabel.setCVimage(cvImage)
         
-        # set mode to segmentation mode
-        self.mode = self.SegmentMode
+    def reset(self):
+        self.imageLabel.resetComputed()
         
-    def computeInflections(self, res):
-        if len(self.points) > 1:
-            fit_x = np.array([])
-            fit_y = np.array([])
-            for crv in self.curves:
-                fit_x = np.hstack((fit_x, crv[:, 0]))
-                fit_y = np.hstack((fit_y, crv[:, 1]))
-                
-            # convert fit_x, fit_y into the physical coordinate.
-            for i, (x, y) in enumerate(zip(fit_x, fit_y)):
-                phy = ImageToPhysics((x,y), res)
-                fit_x[i] = phy[0]
-                fit_y[i] = phy[1]
+    @pyqtSlot()
+    def repaintRequested(self):
+        self.imageLabel.repaint()
             
-            try:                
-                tck, u = interpolate.splprep([fit_x, fit_y], k=4)
-                out = interpolate.splev(u, tck)
-                
-                # convert interpolated curve points to Image Coordinate.
-                for i, (x, y) in enumerate(zip(out[0], out[1])):
-                    img = PhysicsToImage((x, y), res)
-                    out[0][i] = img[0]
-                    out[1][i] = img[1]
-                    
-                self.interpCurve = np.column_stack((out[0], out[1])).astype(np.int32)
-                
-                # compute length
-                dxdy = res * np.diff(self.interpCurve, axis=0)
-                length = np.sum( np.linalg.norm(dxdy, 2, axis=1) )
-                
-                unew = np.linspace(0, 1, len(u), endpoint=True)
-                dx = interpolate.splev(unew, tck, der=1)
-                ddx = interpolate.splev(unew, tck, der=2)
-                k_sample = (dx[0]*ddx[1]-ddx[0]*dx[1])/np.linalg.norm(dx)**3
-                fs = interpolate.InterpolatedUnivariateSpline(unew, k_sample, k=3)
-                roots = fs.roots()      
+    @pyqtSlot()
+    def computeInflections(self):
+        self.imageLabel.computeInflections(np.array([self.control.getXres(), self.control.getYres()]))    
+        
+    @pyqtSlot()
+    def pointsChanged(self):
+        self.control.adjustSmoothingCondition(self.imageLabel.getNumberOfPoints())
+        
+class SegmentWidget(QWidget):
+    messagePrinted = pyqtSignal(str)
     
-                if (len(roots)>0):
-                    outroots = []
-                    out = interpolate.splev(roots, tck)
-                    for ipt in np.transpose(out):
-                        ipt = PhysicsToImage(ipt, res)
-                        outroots.append(ipt)
-                    roots = outroots            
-                self.inflections = roots
-                self.messagePrinted.emit("Inflection points: {} length: {:.2f} mm".format(len(roots), length))
-            except ValueError as e:
-                print e
-                pass
-        self.repaint()        
+    class ImageControl(QLabel):
+        ''' Image control (segmentation) '''
+        messagePrinted = pyqtSignal(str)
+        seedChanged = pyqtSignal()
         
-    def drawCurves(self, painter):
-        painter.setPen(Qt.red)
-        for crv in self.curves:                
-            drawCurve(painter, crv)
-            
-        drawCurve(painter, self.curCrv)            
-        if self.controlPanel.isDrawingControlPoints():
-            pen = QPen(painter.pen())
-            pen.setColor(QColor(Qt.red))
-            painter.setPen(pen)
-            painter.setBrush(Qt.red)
-            
-            for p in self.points:
-                painter.drawEllipse(p[0], p[1], self.pointSize, self.pointSize)
-            
-    def drawInflectionPoints(self, painter):                    
-        try:
-            painter.setPen(Qt.green)
-            drawCurve(painter, self.interpCurve)
-            
-            if self.controlPanel.isDrawingInflections():
-                pen = QPen(painter.pen())
-                pen.setColor(QColor(Qt.green))
-                painter.setPen(pen)
-                painter.setBrush(Qt.green)
-            
-                for p in self.inflections:
-                    painter.drawEllipse(p[0], p[1], self.pointSize, self.pointSize)
-        except TypeError:
-            pass
-        
-    def paintEvent(self, paintEvent):
-        if self.qImage != None:
-            painter = QPainter()
-            painter.begin(self)
-            painter.drawImage(0, 0, self.qImage)
-            
-            if self.controlPanel.isDrawingInputCurves():
-                self.drawCurves(painter)
+        def __init__(self, control, parent=None):
+            super(SegmentWidget.ImageControl, self).__init__(parent)
+            self.control = control
+            self.cvImage = None
+            self.qImage = None
+            self.segImage = None
+            self.qsegImage = None            
+            self.seeds = []
                 
-            self.drawInflectionPoints(painter)
+        def setCVimage(self, cvImage):
+            self.seeds = []
+            self.cvImage = cvImage
+            self.qImage = ConvertCVImg2QImage(cvImage)
             
-            painter.end()
-            
-    def livewireModeMousePressEvent(self, event):
-        if Qt.LeftButton == event.button():
-            if Qt.ShiftModifier == event.modifiers():
-                if len(self.points) > 0:
-                    cnt = LiveContour(self.lastPt, self.p)
-                    s = tuple(cnt[-1])
-                    self.curves.append(cnt)
-                else:
-                    s = (event.x(), event.y())
-            
-                self.points.append(s)
-                mylivewire.mylivewire(self.p, s, self.G)
-                self.curCrv = None
-            else:
-                self.lastPt = (event.y(), event.x())
-                self.curCrv = LiveContour(self.lastPt, self.p)
+            self.setFixedSize(self.qImage.size())
             self.repaint()
-        elif Qt.RightButton == event.button():
-            self.interpCurve = None
-            self.inflections = None            
-            try:
-                self.points.pop()        
-                self.curves.pop()        
-                s = self.points[-1]
-                mylivewire.mylivewire(self.p, s, self.G)
-            except IndexError:
-                pass
-            self.repaint()
+                        
+        def createSegmentation(self):
+            self.segImage = segmentImage(self.cvImage, self.seeds, 
+                                         self.control.getIteration(),
+                                         self.control.getMultiplier())
+            kernsize = self.control.getKernelSize()
+            kernel = np.ones((kernsize, kernsize),np.uint8)
+            self.segImage = cv2.morphologyEx(self.segImage, cv2.MORPH_CLOSE, kernel)
+            #DebugData.dbgImage = self.segImage.copy()
+            #print "set dbgImage", type(DebugData.dbgImage)
+            self.qsegImage = ConvertCVImg2QImage(self.segImage)
+
+        def clearSegmentation(self):
+            self.segImage = None
+            self.qsegImage = None
+                        
+        def paintEvent(self, paintEvent):
+            if self.qImage != None:
+                painter = QPainter()
+                painter.begin(self)
+                painter.drawImage(0, 0, self.qImage)
+                
+                if self.qsegImage != None:
+                    painter.setOpacity(self.control.getOpacity()/100.0)
+                    painter.drawImage(0, 0, self.qsegImage)
+                    painter.setOpacity(1.0)
+                
+                pen = QPen(painter.pen())
+                pen.setColor(QColor(Qt.red))
+                painter.setPen(pen)
+                painter.setBrush(Qt.red)
             
-    def segmentModeMousePressEvent(self, event):
-        if Qt.LeftButton == event.button():
-            s = (event.y(), event.x())        
-            # 여기서 segmentation 수행            
-            img = cv2.cvtColor(self.cvImage, cv2.COLOR_RGB2GRAY)
-            sitkImage = sitk.GetImageFromArray(img)            
-            sitkImage = sitk.CurvatureFlow(sitkImage, 0.125, 5)
-            sitkImage = sitk.ConfidenceConnected(sitkImage, [s], 5, 2.5, 1, 255)
-            img = sitk.GetArrayFromImage(sitkImage)
-            qImg = self.cvImage * img[..., np.newaxis]            
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)            
-            self.qImage = ConvertCVImg2QImage(qImg)
-            
-            # do this after segmentation
-            self.G = PrepareLiveWire(img)
-            self.p = np.zeros(self.G.shape, dtype=np.int32)
-            self.repaint()
-            
-            self.mode = self.LiveWireMode;
+                for p in self.seeds:
+                    painter.drawEllipse(p[0], p[1], Settings.pointSize, Settings.pointSize)
+                
+                painter.end()
+
+        def mousePressEvent(self, event):
+            super(SegmentWidget.ImageControl, self).mousePressEvent(event)
+            if Qt.LeftButton == event.button():
+                s = (event.x(), event.y())
+                self.seeds.append(s)
+                self.createSegmentation()
+                self.repaint()
+            elif Qt.RightButton == event.button():
+                if (len(self.seeds) > 0):
+                    self.seeds.pop()
+                    self.createSegmentation()
+                    self.repaint()                    
+    
+    class ControlPanel(QWidget):
+        ''' segmentation control '''
         
-    def mousePressEvent(self, event):
-        super(MyImage, self).mousePressEvent(event)
-        if self.LiveWireMode == self.mode:
-            self.livewireModeMousePressEvent(event)
-        elif self.SegmentMode == self.mode:
-            self.segmentModeMousePressEvent(event)
+        showPreview = pyqtSignal()
+        showOriginal = pyqtSignal()
+        repaintRequested = pyqtSignal()
+        segmentationRequested = pyqtSignal()
+        
+        def __init__(self, parent=None):
+            super(SegmentWidget.ControlPanel, self).__init__(parent)
+            
+            optLayout = QHBoxLayout()
+            
+            # create multiplier
+            optLayout.addWidget(QLabel("Multiplier"))
+            self.multiplier = QDoubleSpinBox(self)
+            self.multiplier.setRange(0.5, 6.0)
+            self.multiplier.setSingleStep(0.1)
+            self.multiplier.setValue(2.5)        
+            self.multiplier.valueChanged.connect(self.segmentationRequested)
+            optLayout.addWidget(self.multiplier)            
+            
+            # create iteration
+            optLayout.addWidget(QLabel("Iteration"))
+            self.iteration = QSpinBox(self)
+            self.iteration.setRange(0, 40)
+            self.iteration.setSingleStep(1)
+            self.iteration.setValue(5)        
+            self.iteration.valueChanged.connect(self.segmentationRequested)
+            optLayout.addWidget(self.iteration)
+            
+            # kernel size
+            optLayout.addWidget(QLabel("Kernel"))
+            self.kernel = QSpinBox(self)
+            self.kernel.setRange(3, 30)
+            self.kernel.setSingleStep(1)
+            self.kernel.setValue(5)        
+            self.kernel.valueChanged.connect(self.segmentationRequested)
+            optLayout.addWidget(self.kernel)
+            
+            # create opacity slider
+            optLayout.addWidget(QLabel("Opacity"))
+            self.opacity = QSlider(Qt.Horizontal, self)
+            self.opacity.setRange(0, 100)
+            self.opacity.setValue(50)    
+            self.opacity.valueChanged.connect(self.changeOpacity)      
+            optLayout.addWidget(self.opacity)
+            self.opacityLabel = QLabel("{0}".format(self.getOpacity()))
+            optLayout.addWidget(self.opacityLabel)
+                                    
+            self.setLayout(optLayout)           
+
+            # original cv image
+            self.cvImage = None
+            
+        @pyqtSlot()
+        def changeOpacity(self):
+            self.opacityLabel.setText("{0}".format(self.getOpacity()))    
+            self.repaintRequested.emit()
+            
+        # @pyqtSlot()
+        # def valueChanged(self, val):
+        #     self.repaintRequested.emit()            
+            
+        def getOpacity(self):
+            return self.opacity.value()
+            
+        def getMultiplier(self):
+            return self.multiplier.value()
+            
+        def getIteration(self):
+            return self.iteration.value()
+            
+        def getKernelSize(self):
+            return self.kernel.value()
+    
+    def __init__(self, parent=None):
+        super(SegmentWidget, self).__init__(parent)
+        
+        self.cvImage = None
+        self.segmentedImage = None
+        
+        self.control = SegmentWidget.ControlPanel(self)
+        self.control.repaintRequested.connect(self.repaintRequested)
+        self.control.segmentationRequested.connect(self.segmentationRequested)
+                
+        self.imageLabel = SegmentWidget.ImageControl(self.control, self)
+        self.imageLabel.resize(400, 400) # initial size
+        self.imageLabel.messagePrinted.connect(self.messagePrinted)
+        
+        self.setLayout(QVBoxLayout())
+        self.layout().addWidget(self.control)
+        self.layout().addWidget(self.imageLabel)
+        self.layout().addWidget(QLabel("Right button: add a point, Left button: remove a point"))
+        
+    def setCVimage(self, cvImage):
+        self.imageLabel.clearSegmentation()
+        self.imageLabel.setCVimage(cvImage)        
+        
+    def getSegmentationImage(self):
+        return self.imageLabel.segImage
+                
+    @pyqtSlot()
+    def segmentationRequested(self):
+        self.imageLabel.createSegmentation()
+        self.imageLabel.repaint()        
+        
+    @pyqtSlot()
+    def repaintRequested(self):        
+        self.imageLabel.repaint()
         
 
 class MyDialog(QDialog):
-    def __setResolutionSpinBox(self, var):
-        var.setRange(0, 100)
-        var.setSingleStep(0.01)
-        var.setDecimals(2)
-        var.setValue(1)
-    
     def __init__(self, parent=None):
         super(MyDialog, self).__init__(parent)
         
@@ -319,35 +580,19 @@ class MyDialog(QDialog):
         layout = QVBoxLayout()    
         self.infoLabel = QLabel(self)
         self.infoLabel.setText("Livewire")
-
-        self.controlPanel = ControlPanel(self)
-        self.controlPanel.requestComputeInflections.connect(self.computeInflections)
-        self.controlPanel.requestRepaint.connect(self.repaintRequested)
+        self.measureWidget = MeasureWidget(self)     
+        self.measureWidget.messagePrinted.connect(self.printMessage)   
         
-        self.sbXres = QDoubleSpinBox(self)
-        self.__setResolutionSpinBox(self.sbXres)        
-        lbXres = QLabel("horizontal res.", self)        
-        lbXres.setBuddy(self.sbXres)
+        self.segmentWidget = SegmentWidget(self)
+        self.segmentWidget.messagePrinted.connect(self.printMessage)   
         
-        self.sbYres = QDoubleSpinBox(self)
-        self.__setResolutionSpinBox(self.sbYres)
-        lbYres = QLabel("vertical res.", self)
-        lbYres.setBuddy(self.sbYres)
-        
-        resolutionLayout = QHBoxLayout()
-        resolutionLayout.addWidget(self.controlPanel)        
-        resolutionLayout.addWidget(lbXres)
-        resolutionLayout.addWidget(self.sbXres)
-        resolutionLayout.addWidget(lbYres)
-        resolutionLayout.addWidget(self.sbYres)        
-                                
-        self.imageLabel = MyImage(self.controlPanel, self) # must be changed to MyImage class
-        self.imageLabel.resize(400, 400) # initial size
-        self.imageLabel.messagePrinted.connect(self.printMessage)
+        self.tabbedWidget = QTabWidget(self)
+        self.tabbedWidget.addTab(self.segmentWidget, "segmentation")
+        self.tabbedWidget.addTab(self.measureWidget, "measure")
+        self.tabbedWidget.currentChanged.connect(self.tabIndexChanged)
         
         layout.addWidget(self.infoLabel)
-        layout.addLayout(resolutionLayout)
-        layout.addWidget(self.imageLabel)    
+        layout.addWidget(self.tabbedWidget)
         
         menu = self.createMenu()
         layout.setMenuBar(menu)
@@ -356,36 +601,33 @@ class MyDialog(QDialog):
         self.setLayout(layout)
         self.imageFilename = None
         
-    @pyqtSlot()
-    def repaintRequested(self):
-        self.imageLabel.repaint()
-
     @pyqtSlot(str)
     def printMessage(self, message):
         self.infoLabel.setText(message)
-            
-    @pyqtSlot()
-    def computeInflections(self):
-        self.imageLabel.computeInflections(np.array([self.sbXres.value(), self.sbYres.value()]))
         
-    def load(self, filename):        
-        self.imageLabel.points, self.imageLabel.curves, self.imageLabel.lastPt, res = np.load(filename)
-        self.sbXres.setValue(res[0])
-        self.sbYres.setValue(res[1])
+    @pyqtSlot(int)
+    def tabIndexChanged(self, idx):
+        if 1 == idx:            
+            segImg = self.segmentWidget.getSegmentationImage()
+            if segImg is not None:
+                self.measureWidget.setCVimage(segImg)        
+                    
+    def load(self, filename):
+        self.measureWidget.load(filename)
     
     def save(self, filename):
-        np.save(filename, [self.imageLabel.points, 
-                           self.imageLabel.curves, 
-                           self.imageLabel.lastPt, 
-                           np.array([self.sbXres.value(), self.sbYres.value()])])
+        self.measureWidget.save(filename)
         
     def loadImage(self):
         filename = QFileDialog.getOpenFileName(self, "Load image file", 
                                                "", "Images (*.tif *.png *.jpg)")
         if filename:
-            cvImage = cv2.imread(filename)
-            self.imageLabel.setCVimage(cvImage)
+            cvImage = cv2.imread(filename)            
+            self.segmentWidget.setCVimage(cvImage)
+            self.measureWidget.reset()
+            self.measureWidget.setCVimage(cvImage)
             self.adjustSize()
+            self.tabbedWidget.setCurrentIndex(0)
             self.infoLabel.setText("{} is now loaded...".format(filename))
             self.imageFilename = filename            
             
@@ -396,14 +638,14 @@ class MyDialog(QDialog):
             if filename:
                 try:
                     self.load(filename)                
-                    self.imageLabel.repaint()
+                    self.measureWidget.imageLabel.repaint()
                 except IOError:
                     QMessageBox.critical(self, "Error!", "Cannot load file");
         else:
             QMessageBox.warning(self, "Cannot load", "Load image first");
             
     def saveCurve(self):
-        if (self.imageFilename is not None) and (len(self.imageLabel.points) > 1):
+        if (self.imageFilename is not None) and (len(self.measureWidget.imageLabel.points) > 1):
             pre, ext = os.path.splitext(self.imageFilename)
             filename = QFileDialog.getSaveFileName(self, "Save curve file", 
                                                    pre + ".npy", "NUMPY files (*.npy)")
@@ -438,18 +680,18 @@ class MyDialog(QDialog):
             #app.exit(1)
             self.close()
             
-    def closeEvent(self, event):
-        print 'saving debugging information'
-        DebugData.res = (self.sbXres.value(), self.sbYres.value())
-        
-        fit_x = np.array([])
-        fit_y = np.array([])
-        for crv in self.imageLabel.curves:
-            fit_x = np.hstack((fit_x, crv[:, 0]))
-            fit_y = np.hstack((fit_y, crv[:, 1]))
-            
-        DebugData.fit_x = fit_x
-        DebugData.fit_y = fit_y
+    #def closeEvent(self, event):
+        # print 'saving debugging information'
+        # DebugData.res = (self.sbXres.value(), self.sbYres.value())
+        # 
+        # fit_x = np.array([])
+        # fit_y = np.array([])
+        # for crv in self.imageLabel.curves:
+        #     fit_x = np.hstack((fit_x, crv[:, 0]))
+        #     fit_y = np.hstack((fit_y, crv[:, 1]))
+        #     
+        # DebugData.fit_x = fit_x
+        # DebugData.fit_y = fit_y
 
 def main():
     app = QApplication(sys.argv)
