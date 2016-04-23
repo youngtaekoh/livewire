@@ -11,8 +11,10 @@ from scipy import interpolate
 import cv2
 import os
 import SimpleITK as sitk
+import util
 
 import mylivewire
+import util
 from PyQt4.QtGui import *
 from PyQt4.QtCore import *
 
@@ -25,17 +27,6 @@ class DebugData():
     
 class Settings():
     pointSize = 6
-
-def ImageToPhysics(pixel, res):
-    ''' convert pixel value in image coordinate to physical coordinate '''
-    x = pixel[0] * res[0] # + origin.x
-    y = pixel[1] * res[1] # + origin.y
-    return (x, y)
-    
-def PhysicsToImage(phy, res):
-    px = int(phy[0] / res[0])
-    py = int(phy[1] / res[1])
-    return (px, py)    
 
 def ConvertCVImg2QImage(cvImage):
     if cvImage is None:
@@ -104,7 +95,7 @@ class MeasureWidget(QWidget):
             super(MeasureWidget.ControlPanel, self).__init__(parent)        
             
             optLayout = QVBoxLayout()
-            self.cbDrawInputCurve = QCheckBox("Input curves")
+            self.cbDrawInputCurve = QCheckBox("Input curve")
             self.cbDrawInputCurve.setChecked(True)
             self.cbDrawInputCurve.stateChanged.connect(self.emitRepaintRequest)
             optLayout.addWidget(self.cbDrawInputCurve)
@@ -113,6 +104,11 @@ class MeasureWidget(QWidget):
             self.cbDrawPoints.setChecked(True)
             self.cbDrawPoints.stateChanged.connect(self.emitRepaintRequest)
             optLayout.addWidget(self.cbDrawPoints)
+
+            self.cbDrawApproxCurve = QCheckBox("Approx. curve")
+            self.cbDrawApproxCurve.setChecked(True)
+            self.cbDrawApproxCurve.stateChanged.connect(self.emitRepaintRequest)
+            optLayout.addWidget(self.cbDrawApproxCurve)
             
             # turn on/off inflection points
             self.cbDrawInflections = QCheckBox("Inflection points")
@@ -125,7 +121,7 @@ class MeasureWidget(QWidget):
             self.smoothing = QDoubleSpinBox(self)
             self.smoothing.setRange(0, 1000)
             self.smoothing.setSingleStep(1)
-            self.smoothing.setValue(100.0)        
+            self.smoothing.setValue(10.0)
             self.smoothing.valueChanged.connect(self.requestComputeInflections)
             optLayout.addWidget(self.smoothing)
             
@@ -170,13 +166,22 @@ class MeasureWidget(QWidget):
             
         def isDrawingInflections(self):
             return self.cbDrawInflections.isChecked()
-            
+
+        def isDrawingApproxCurve(self):
+            return self.cbDrawApproxCurve.isChecked()
+
         def getXres(self):
             return self.sbXres.value()
+
+        def setXres(self, val):
+            self.sbXres.setValue(val)
             
         def getYres(self):
             return self.sbYres.value()
-            
+
+        def setYres(self, val):
+            self.sbYres.setValue(val)
+
         def getInterpolationParams(self):
             return self.smoothing.value()
             
@@ -184,7 +189,7 @@ class MeasureWidget(QWidget):
             ''' adjust smoothing spin box according to m '''
             min, max = (m-np.math.sqrt(2*m),m+np.math.sqrt(2*m))
             self.smoothing.setRange(0, max*1.5)
-            self.smoothing.setValue((min + max)*0.5)
+            self.smoothing.setValue((min + max)*0.07)
     
     class MyImage(QLabel):
         ''' Image control '''
@@ -224,18 +229,19 @@ class MeasureWidget(QWidget):
                     
                 # convert fit_x, fit_y into the physical coordinate.
                 for i, (x, y) in enumerate(zip(fit_x, fit_y)):
-                    phy = ImageToPhysics((x,y), res)
+                    phy = util.ImageToPhysics((x,y), res)
                     fit_x[i] = phy[0]
                     fit_y[i] = phy[1]
                 
-                try:                
+                try:
+                    smooth_x, smooth_y, _ = util.smoothCurve(fit_x, fit_y)
                     user_s = self.controlPanel.getInterpolationParams()
-                    tck, u = interpolate.splprep([fit_x, fit_y], k=4, s=user_s)
+                    tck, u = interpolate.splprep([smooth_x, smooth_y], k=4, s=user_s)
                     out = interpolate.splev(u, tck)
                     
                     # convert interpolated curve points to Image Coordinate.
                     for i, (x, y) in enumerate(zip(out[0], out[1])):
-                        img = PhysicsToImage((x, y), res)
+                        img = util.PhysicsToImage((x, y), res)
                         out[0][i] = img[0]
                         out[1][i] = img[1]
                         
@@ -256,7 +262,7 @@ class MeasureWidget(QWidget):
                         outroots = []
                         out = interpolate.splev(roots, tck)
                         for ipt in np.transpose(out):
-                            ipt = PhysicsToImage(ipt, res)
+                            ipt = util.PhysicsToImage(ipt, res)
                             outroots.append(ipt)
                         roots = outroots            
                     self.inflections = roots
@@ -283,8 +289,9 @@ class MeasureWidget(QWidget):
                 
         def drawInflectionPoints(self, painter):                    
             try:
-                painter.setPen(Qt.green)
-                drawCurve(painter, self.interpCurve)
+                if self.controlPanel.isDrawingApproxCurve():
+                    painter.setPen(Qt.green)
+                    drawCurve(painter, self.interpCurve)
                 
                 if self.controlPanel.isDrawingInflections():
                     pen = QPen(painter.pen())
@@ -365,14 +372,27 @@ class MeasureWidget(QWidget):
         layout.addWidget(self.imageLabel)
         layout.addWidget(self.control)
         self.layout().addLayout(layout)
-        self.layout().addWidget(QLabel("Right button: add a point, Left button: remove a point"))
+        self.layout().addWidget(QLabel("Left button: add a point, Right button: remove a point"))
         
     def setCVimage(self, cvImage):
         self.imageLabel.setCVimage(cvImage)
         
     def reset(self):
         self.imageLabel.resetComputed()
-        
+
+    def load(self, filename):
+        self.imageLabel.points, self.imageLabel.curves, self.imageLabel.lastPt, smoothing, res = np.load(filename)
+        self.control.smoothing.setValue(smoothing)
+        self.control.setXres(res[0])
+        self.control.setYres(res[1])
+
+    def save(self, filename):
+        np.save(filename, [self.imageLabel.points,
+                           self.imageLabel.curves,
+                           self.imageLabel.lastPt,
+                           self.control.smoothing.value(),
+                           np.array([self.control.getXres(), self.control.getYres()])])
+
     @pyqtSlot()
     def repaintRequested(self):
         self.imageLabel.repaint()
@@ -383,7 +403,8 @@ class MeasureWidget(QWidget):
         
     @pyqtSlot()
     def pointsChanged(self):
-        self.control.adjustSmoothingCondition(self.imageLabel.getNumberOfPoints())
+        #self.control.adjustSmoothingCondition(self.imageLabel.getNumberOfPoints())
+        pass
         
 class SegmentWidget(QWidget):
     messagePrinted = pyqtSignal(str)
@@ -411,12 +432,16 @@ class SegmentWidget(QWidget):
             self.repaint()
                         
         def createSegmentation(self):
-            self.segImage = segmentImage(self.cvImage, self.seeds, 
-                                         self.control.getIteration(),
-                                         self.control.getMultiplier())
-            kernsize = self.control.getKernelSize()
-            kernel = np.ones((kernsize, kernsize),np.uint8)
-            self.segImage = cv2.morphologyEx(self.segImage, cv2.MORPH_CLOSE, kernel)
+            if len(self.seeds) > 0:
+                self.segImage = segmentImage(self.cvImage, self.seeds,
+                                             self.control.getIteration(),
+                                             self.control.getMultiplier())
+                kernsize = self.control.getKernelSize()
+                kernel = np.ones((kernsize, kernsize),np.uint8)
+                self.segImage = cv2.morphologyEx(self.segImage, cv2.MORPH_CLOSE, kernel)
+                self.segImage = cv2.GaussianBlur(self.segImage, (5, 5), 0)
+            else:
+                self.segImage = self.cvImage.copy()
             #DebugData.dbgImage = self.segImage.copy()
             #print "set dbgImage", type(DebugData.dbgImage)
             self.qsegImage = ConvertCVImg2QImage(self.segImage)
@@ -552,7 +577,7 @@ class SegmentWidget(QWidget):
         self.setLayout(QVBoxLayout())
         self.layout().addWidget(self.control)
         self.layout().addWidget(self.imageLabel)
-        self.layout().addWidget(QLabel("Right button: add a point, Left button: remove a point"))
+        self.layout().addWidget(QLabel("Left button: add a point, Right button: remove a point"))
         
     def setCVimage(self, cvImage):
         self.imageLabel.clearSegmentation()
@@ -611,13 +636,13 @@ class MyDialog(QDialog):
             segImg = self.segmentWidget.getSegmentationImage()
             if segImg is not None:
                 self.measureWidget.setCVimage(segImg)        
-                    
+
     def load(self, filename):
         self.measureWidget.load(filename)
-    
+
     def save(self, filename):
         self.measureWidget.save(filename)
-        
+
     def loadImage(self):
         filename = QFileDialog.getOpenFileName(self, "Load image file", 
                                                "", "Images (*.tif *.png *.jpg)")
